@@ -1,65 +1,45 @@
 #![deny(warnings)]
-extern crate hyper;
-extern crate futures;
-extern crate pretty_env_logger;
-extern crate tokio;
+#![warn(rust_2018_idioms)]
 
-use futures::{Future, Stream};
-use futures::future::{FutureResult, lazy};
-
-use hyper::{Body, Method, Request, Response, StatusCode};
-use hyper::server::{Http, Service};
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{service_fn, make_service_fn};
+use futures_util::future::join;
 
 static INDEX1: &'static [u8] = b"The 1st service!";
 static INDEX2: &'static [u8] = b"The 2nd service!";
 
-struct Srv(&'static [u8]);
-
-impl Service for Srv {
-    type Request = Request<Body>;
-    type Response = Response<Body>;
-    type Error = hyper::Error;
-    type Future = FutureResult<Response<Body>, hyper::Error>;
-
-    fn call(&self, req: Request<Body>) -> Self::Future {
-        futures::future::ok(match (req.method(), req.uri().path()) {
-            (&Method::GET, "/") => {
-                Response::new(self.0.into())
-            },
-            _ => {
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::empty())
-                    .unwrap()
-            }
-        })
-    }
-
+async fn index1(_: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    Ok(Response::new(Body::from(INDEX1)))
 }
 
+async fn index2(_: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    Ok(Response::new(Body::from(INDEX2)))
+}
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pretty_env_logger::init();
-    let addr1 = "127.0.0.1:1337".parse().unwrap();
-    let addr2 = "127.0.0.1:1338".parse().unwrap();
 
-    tokio::run(lazy(move || {
-        let srv1 = Http::new().serve_addr(&addr1, || Ok(Srv(INDEX1))).unwrap();
-        let srv2 = Http::new().serve_addr(&addr2, || Ok(Srv(INDEX2))).unwrap();
+    let addr1 = ([127, 0, 0, 1], 1337).into();
+    let addr2 = ([127, 0, 0, 1], 1338).into();
 
-        println!("Listening on http://{}", srv1.incoming_ref().local_addr());
-        println!("Listening on http://{}", srv2.incoming_ref().local_addr());
+    let srv1 = Server::bind(&addr1)
+        .serve(make_service_fn(|_| {
+            async {
+                Ok::<_, hyper::Error>(service_fn(index1))
+            }
+        }));
 
-        tokio::spawn(srv1.for_each(move |conn| {
-            tokio::spawn(conn.map(|_| ()).map_err(|err| println!("srv1 error: {:?}", err)));
-            Ok(())
-        }).map_err(|_| ()));
+    let srv2 = Server::bind(&addr2)
+        .serve(make_service_fn(|_| {
+            async {
+                Ok::<_, hyper::Error>(service_fn(index2))
+            }
+        }));
 
-        tokio::spawn(srv2.for_each(move |conn| {
-            tokio::spawn(conn.map(|_| ()).map_err(|err| println!("srv2 error: {:?}", err)));
-            Ok(())
-        }).map_err(|_| ()));
+    println!("Listening on http://{} and http://{}", addr1, addr2);
 
-        Ok(())
-    }));
+    let _ret = join(srv1, srv2).await;
+
+    Ok(())
 }

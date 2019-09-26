@@ -1,32 +1,36 @@
 #![deny(warnings)]
-extern crate hyper;
-extern crate futures;
-extern crate pretty_env_logger;
-extern crate tokio;
 
-use futures::Future;
-use futures::future::lazy;
+use std::convert::Infallible;
 
-use hyper::{Body, Response};
-use hyper::server::{Http, const_service, service_fn};
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
 
-static PHRASE: &'static [u8] = b"Hello World!";
+async fn hello(_: Request<Body>) -> Result<Response<Body>, Infallible> {
+    Ok(Response::new(Body::from("Hello World!")))
+}
 
-fn main() {
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pretty_env_logger::init();
+
+    // For every connection, we must make a `Service` to handle all
+    // incoming HTTP requests on said connection.
+    let make_svc = make_service_fn(|_conn| {
+        // This is the `Service` that will handle the connection.
+        // `service_fn` is a helper to convert a function that
+        // returns a Response into a `Service`.
+        async {
+            Ok::<_, Infallible>(service_fn(hello))
+        }
+    });
+
     let addr = ([127, 0, 0, 1], 3000).into();
 
-    let new_service = const_service(service_fn(|_| {
-        Ok(Response::new(Body::from(PHRASE)))
-    }));
+    let server = Server::bind(&addr).serve(make_svc);
 
-    tokio::run(lazy(move || {
-        let server = Http::new()
-            .sleep_on_errors(true)
-            .bind(&addr, new_service)
-            .unwrap();
+    println!("Listening on http://{}", addr);
 
-        println!("Listening on http://{} with 1 thread.", server.local_addr().unwrap());
-        server.run().map_err(|err| eprintln!("Server error {}", err))
-    }));
+    server.await?;
+
+    Ok(())
 }

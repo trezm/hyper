@@ -2,56 +2,52 @@ use std::fmt;
 use std::io::{self};
 use std::marker::PhantomData;
 
-use bytes::Bytes;
-use futures::{Async, AsyncSink, Poll, StartSend};
-use futures::task::Task;
-use http::{Method, Version};
+use bytes::{Buf, Bytes};
+use http::{HeaderMap, Method, Version};
+use http::header::{HeaderValue, CONNECTION};
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use proto::{BodyLength, Chunk, Decode, Http1Transaction, MessageHead};
-use super::io::{Cursor, Buffered};
-use super::{EncodedBuf, Encoder, Decoder};
+use crate::Chunk;
+use crate::common::{Pin, Poll, Unpin, task};
+use crate::proto::{BodyLength, DecodedLength, MessageHead};
+use crate::headers::connection_keep_alive;
+use super::io::{Buffered};
+use super::{EncodedBuf, Encode, Encoder, /*Decode,*/ Decoder, Http1Transaction, ParseContext};
 
+const H2_PREFACE: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// This handles a connection, which will have been established over an
 /// `AsyncRead + AsyncWrite` (like a socket), and will likely include multiple
 /// `Transaction`s over HTTP.
 ///
 /// The connection will determine when a message begins and ends as well as
-/// determine if this  connection can be kept alive after the message,
+/// determine if this connection can be kept alive after the message,
 /// or if it is complete.
-pub struct Conn<I, B, T> {
-    io: Buffered<I, EncodedBuf<Cursor<B>>>,
+pub(crate) struct Conn<I, B, T> {
+    io: Buffered<I, EncodedBuf<B>>,
     state: State,
-    _marker: PhantomData<T>
+    _marker: PhantomData<fn(T)>
 }
-
-/*
-impl<I, B> Conn<I, B, ClientTransaction>
-where I: AsyncRead + AsyncWrite,
-      B: AsRef<[u8]>,
-{
-    pub fn new_client(io: I) -> Conn<I, B, ClientTransaction> {
-        Conn::new(io)
-    }
-}
-*/
 
 impl<I, B, T> Conn<I, B, T>
-where I: AsyncRead + AsyncWrite,
-      B: AsRef<[u8]>,
+where I: AsyncRead + AsyncWrite + Unpin,
+      B: Buf,
       T: Http1Transaction,
 {
     pub fn new(io: I) -> Conn<I, B, T> {
         Conn {
             io: Buffered::new(io),
             state: State {
+                allow_half_close: true,
+                cached_headers: None,
                 error: None,
                 keep_alive: KA::Busy,
                 method: None,
-                read_task: None,
+                title_case_headers: false,
+                notify_read: false,
                 reading: Reading::Init,
                 writing: Writing::Init,
+                upgrade: None,
                 // We assume a modern world where the remote speaks HTTP/1.1.
                 // If they tell us otherwise, we'll downgrade in `read_head`.
                 version: Version::HTTP_11,
@@ -68,12 +64,28 @@ where I: AsyncRead + AsyncWrite,
         self.io.set_max_buf_size(max);
     }
 
+    pub fn set_read_buf_exact_size(&mut self, sz: usize) {
+        self.io.set_read_buf_exact_size(sz);
+    }
+
     pub fn set_write_strategy_flatten(&mut self) {
         self.io.set_write_strategy_flatten();
     }
 
+    pub fn set_title_case_headers(&mut self) {
+        self.state.title_case_headers = true;
+    }
+
+    pub(crate) fn set_disable_half_close(&mut self) {
+        self.state.allow_half_close = false;
+    }
+
     pub fn into_inner(self) -> (I, Bytes) {
         self.io.into_inner()
+    }
+
+    pub fn pending_upgrade(&mut self) -> Option<crate::upgrade::Pending> {
+        self.state.upgrade.take()
     }
 
     pub fn is_read_closed(&self) -> bool {
@@ -86,7 +98,6 @@ where I: AsyncRead + AsyncWrite,
 
     pub fn can_read_head(&self) -> bool {
         match self.state.reading {
-            //Reading::Init => true,
             Reading::Init => {
                 if T::should_read_first() {
                     true
@@ -113,119 +124,100 @@ where I: AsyncRead + AsyncWrite,
         T::should_error_on_parse_eof() && !self.state.is_idle()
     }
 
-    pub fn read_head(&mut self) -> Poll<Option<(MessageHead<T::Incoming>, bool)>, ::Error> {
+    fn has_h2_prefix(&self) -> bool {
+        let read_buf = self.io.read_buf();
+        read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
+    }
+
+    pub fn poll_read_head(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<crate::Result<(MessageHead<T::Incoming>, DecodedLength, bool)>>> {
         debug_assert!(self.can_read_head());
         trace!("Conn::read_head");
 
-        loop {
-            let (version, head) = match self.io.parse::<T>() {
-                Ok(Async::Ready(head)) => (head.version, head),
-                Ok(Async::NotReady) => return Ok(Async::NotReady),
-                Err(e) => {
-                    // If we are currently waiting on a message, then an empty
-                    // message should be reported as an error. If not, it is just
-                    // the connection closing gracefully.
-                    let must_error = self.should_error_on_eof();
-                    self.state.close_read();
-                    self.io.consume_leading_lines();
-                    let was_mid_parse = !self.io.read_buf().is_empty();
-                    return if was_mid_parse || must_error {
-                        debug!("parse error ({}) with {} bytes", e, self.io.read_buf().len());
-                        self.on_parse_error(e)
-                            .map(|()| Async::NotReady)
-                    } else {
-                        debug!("read eof");
-                        Ok(Async::Ready(None))
-                    };
-                }
-            };
+        let msg = match ready!(self.io.parse::<T>(cx, ParseContext {
+            cached_headers: &mut self.state.cached_headers,
+            req_method: &mut self.state.method,
+        })) {
+            Ok(msg) => msg,
+            Err(e) => return self.on_read_head_error(e),
+        };
 
-            match version {
-                Version::HTTP_10 |
-                Version::HTTP_11 => {},
-                _ => {
-                    error!("unimplemented HTTP Version = {:?}", version);
-                    self.state.close_read();
-                    return Err(::Error::Version);
-                }
-            };
-            self.state.version = version;
+        // Note: don't deconstruct `msg` into local variables, it appears
+        // the optimizer doesn't remove the extra copies.
 
-            let decoder = match T::decoder(&head, &mut self.state.method) {
-                Ok(Decode::Normal(d)) => {
-                    d
-                },
-                Ok(Decode::Final(d)) => {
-                    trace!("final decoder, HTTP ending");
-                    debug_assert!(d.is_eof());
-                    self.state.close_read();
-                    d
-                },
-                Ok(Decode::Ignore) => {
-                    // likely a 1xx message that we can ignore
-                    continue;
-                }
-                Err(e) => {
-                    debug!("decoder error = {:?}", e);
-                    self.state.close_read();
-                    return self.on_parse_error(e)
-                        .map(|()| Async::NotReady);
-                }
-            };
+        debug!("incoming body is {}", msg.decode);
 
-            debug!("incoming body is {}", decoder);
+        self.state.busy();
+        self.state.keep_alive &= msg.keep_alive;
+        self.state.version = msg.head.version;
 
-            self.state.busy();
-            if head.expecting_continue() {
-                let msg = b"HTTP/1.1 100 Continue\r\n\r\n";
-                self.io.write_buf_mut().extend_from_slice(msg);
+        if msg.decode == DecodedLength::ZERO {
+            debug_assert!(!msg.expect_continue, "expect-continue needs a body");
+            self.state.reading = Reading::KeepAlive;
+            if !T::should_read_first() {
+                self.try_keep_alive(cx);
             }
-            let wants_keep_alive = head.should_keep_alive();
-            self.state.keep_alive &= wants_keep_alive;
-            let (body, reading) = if decoder.is_eof() {
-                (false, Reading::KeepAlive)
-            } else {
-                (true, Reading::Body(decoder))
-            };
-            if let Reading::Closed = self.state.reading {
-                // actually want an `if not let ...`
-            } else {
-                self.state.reading = reading;
+        } else {
+            if msg.expect_continue {
+                let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
+                self.io.headers_buf().extend_from_slice(cont);
             }
-            if !body {
-                self.try_keep_alive();
+            self.state.reading = Reading::Body(Decoder::new(msg.decode));
+        };
+
+        Poll::Ready(Some(Ok((msg.head, msg.decode, msg.wants_upgrade))))
+    }
+
+    fn on_read_head_error<Z>(&mut self, e: crate::Error) -> Poll<Option<crate::Result<Z>>> {
+        // If we are currently waiting on a message, then an empty
+        // message should be reported as an error. If not, it is just
+        // the connection closing gracefully.
+        let must_error = self.should_error_on_eof();
+        self.state.close_read();
+        self.io.consume_leading_lines();
+        let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();
+        if was_mid_parse || must_error {
+            // We check if the buf contains the h2 Preface
+            debug!("parse error ({}) with {} bytes", e, self.io.read_buf().len());
+            match self.on_parse_error(e) {
+                Ok(()) => Poll::Pending, // XXX: wat?
+                Err(e) => Poll::Ready(Some(Err(e))),
+
             }
-            return Ok(Async::Ready(Some((head, body))));
+        } else {
+            debug!("read eof");
+            Poll::Ready(None)
         }
     }
 
-    pub fn read_body(&mut self) -> Poll<Option<Chunk>, io::Error> {
+    pub fn poll_read_body(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<io::Result<Chunk>>> {
         debug_assert!(self.can_read_body());
-
-        trace!("Conn::read_body");
 
         let (reading, ret) = match self.state.reading {
             Reading::Body(ref mut decoder) => {
-                match decoder.decode(&mut self.io) {
-                    Ok(Async::Ready(slice)) => {
-                        let (reading, chunk) = if !slice.is_empty() {
-                            return Ok(Async::Ready(Some(Chunk::from(slice))));
-                        } else if decoder.is_eof() {
+                match decoder.decode(cx, &mut self.io) {
+                    Poll::Ready(Ok(slice)) => {
+                        let (reading, chunk) = if decoder.is_eof() {
                             debug!("incoming body completed");
-                            (Reading::KeepAlive, None)
-                        } else {
-                            trace!("decode stream unexpectedly ended");
-                            // this should actually be unreachable:
-                            // the decoder will return an UnexpectedEof if there were
-                            // no bytes to read and it isn't eof yet...
+                            (Reading::KeepAlive, if !slice.is_empty() {
+                                Some(Ok(Chunk::from(slice)))
+                            } else {
+                                None
+                            })
+                        } else if slice.is_empty() {
+                            error!("decode stream unexpectedly ended");
+                            // This should be unreachable, since all 3 decoders
+                            // either set eof=true or return an Err when reading
+                            // an empty slice...
                             (Reading::Closed, None)
+                        } else {
+                            return Poll::Ready(Some(Ok(Chunk::from(slice))));
                         };
-                        (reading, Ok(Async::Ready(chunk)))
+                        (reading, Poll::Ready(chunk))
                     },
-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
-                    Err(e) => {
-                        trace!("decode stream error: {}", e);
-                        (Reading::Closed, Err(e))
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => {
+                        debug!("decode stream error: {}", e);
+                        (Reading::Closed, Poll::Ready(Some(Err(e))))
                     },
                 }
             },
@@ -233,21 +225,24 @@ where I: AsyncRead + AsyncWrite,
         };
 
         self.state.reading = reading;
-        self.try_keep_alive();
+        self.try_keep_alive(cx);
         ret
     }
 
-    pub fn read_keep_alive(&mut self) -> Result<(), ::Error> {
+    pub fn wants_read_again(&mut self) -> bool {
+        let ret = self.state.notify_read;
+        self.state.notify_read = false;
+        ret
+    }
+
+    pub fn poll_read_keep_alive(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         debug_assert!(!self.can_read_head() && !self.can_read_body());
 
-        trace!("read_keep_alive; is_mid_message={}", self.is_mid_message());
-
         if self.is_mid_message() {
-            self.maybe_park_read();
+            self.mid_message_detect_eof(cx)
         } else {
-            self.require_empty_read()?;
+            self.require_empty_read(cx)
         }
-        Ok(())
     }
 
     fn is_mid_message(&self) -> bool {
@@ -257,104 +252,82 @@ where I: AsyncRead + AsyncWrite,
         }
     }
 
-    fn maybe_park_read(&mut self) {
-        if !self.io.is_read_blocked() {
-            // the Io object is ready to read, which means it will never alert
-            // us that it is ready until we drain it. However, we're currently
-            // finished reading, so we need to park the task to be able to
-            // wake back up later when more reading should happen.
-            let park = self.state.read_task.as_ref()
-                .map(|t| !t.will_notify_current())
-                .unwrap_or(true);
-            if park {
-                trace!("parking current task");
-                self.state.read_task = Some(::futures::task::current());
-            }
-        }
-    }
-
     // This will check to make sure the io object read is empty.
     //
     // This should only be called for Clients wanting to enter the idle
     // state.
-    fn require_empty_read(&mut self) -> io::Result<()> {
-        assert!(!self.can_read_head() && !self.can_read_body());
+    fn require_empty_read(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+        debug_assert!(!self.can_read_head() && !self.can_read_body());
+        debug_assert!(!self.is_mid_message());
+        debug_assert!(T::is_client());
 
         if !self.io.read_buf().is_empty() {
             debug!("received an unexpected {} bytes", self.io.read_buf().len());
-            Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected bytes after message ended"))
+            return Poll::Ready(Err(crate::Error::new_unexpected_message()));
+        }
+
+        let num_read = ready!(self.force_io_read(cx)).map_err(crate::Error::new_io)?;
+
+        if num_read == 0 {
+            let ret = if self.should_error_on_eof() {
+                trace!("found unexpected EOF on busy connection: {:?}", self.state);
+                Poll::Ready(Err(crate::Error::new_incomplete()))
+            } else {
+                trace!("found EOF on idle connection, closing");
+                Poll::Ready(Ok(()))
+            };
+
+            // order is important: should_error needs state BEFORE close_read
+            self.state.close_read();
+            return ret;
+        }
+
+        debug!("received unexpected {} bytes on an idle connection", num_read);
+        Poll::Ready(Err(crate::Error::new_unexpected_message()))
+    }
+
+    fn mid_message_detect_eof(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+        debug_assert!(!self.can_read_head() && !self.can_read_body());
+        debug_assert!(self.is_mid_message());
+
+        if self.state.allow_half_close || !self.io.read_buf().is_empty() {
+            return Poll::Pending;
+        }
+
+        let num_read = ready!(self.force_io_read(cx)).map_err(crate::Error::new_io)?;
+
+        if num_read == 0 {
+            trace!("found unexpected EOF on busy connection: {:?}", self.state);
+            self.state.close_read();
+            Poll::Ready(Err(crate::Error::new_incomplete()))
         } else {
-            match self.try_io_read()? {
-                Async::Ready(0) => {
-                    // case handled in try_io_read
-                    Ok(())
-                },
-                Async::Ready(n) => {
-                    debug!("received {} bytes on an idle connection", n);
-                    let desc = if self.state.is_idle() {
-                        "unexpected bytes after message ended"
-                    } else {
-                        "unexpected bytes before writing message"
-                    };
-                    Err(io::Error::new(io::ErrorKind::InvalidData, desc))
-                },
-                Async::NotReady => {
-                    Ok(())
-                },
-            }
+            Poll::Ready(Ok(()))
         }
     }
 
-    fn try_io_read(&mut self) -> Poll<usize, io::Error> {
-         match self.io.read_from_io() {
-            Ok(Async::Ready(0)) => {
-                trace!("try_io_read; found EOF on connection: {:?}", self.state);
-                let must_error = self.should_error_on_eof();
-                let ret = if must_error {
-                    let desc = if self.is_mid_message() {
-                        "unexpected EOF waiting for response"
-                    } else {
-                        "unexpected EOF before writing message"
-                    };
-                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, desc))
-                } else {
-                    Ok(Async::Ready(0))
-                };
-
-                // order is important: must_error needs state BEFORE close_read
-                self.state.close_read();
-                ret
-            },
-            Ok(Async::Ready(n)) => {
-                Ok(Async::Ready(n))
-            },
-            Ok(Async::NotReady) => {
-                Ok(Async::NotReady)
-            },
-            Err(e) => {
-                self.state.close();
-                Err(e)
-            }
-        }
+    fn force_io_read(&mut self, cx: &mut task::Context<'_>) -> Poll<io::Result<usize>> {
+        let result = ready!(self.io.poll_read_from_io(cx));
+        Poll::Ready(result.map_err(|e| {
+            trace!("force_io_read; io error = {:?}", e);
+            self.state.close();
+            e
+         }))
     }
 
 
-    fn maybe_notify(&mut self) {
+    fn maybe_notify(&mut self, cx: &mut task::Context<'_>) {
         // its possible that we returned NotReady from poll() without having
         // exhausted the underlying Io. We would have done this when we
         // determined we couldn't keep reading until we knew how writing
         // would finish.
-        //
-        // When writing finishes, we need to wake the task up in case there
-        // is more reading that can be done, to start a new message.
 
 
 
-        let wants_read = match self.state.reading {
+        match self.state.reading {
             Reading::Body(..) |
-            Reading::KeepAlive => return,
-            Reading::Init => true,
-            Reading::Closed => false,
+            Reading::KeepAlive |
+            Reading::Closed => return,
+            Reading::Init => (),
         };
 
         match self.state.writing {
@@ -365,31 +338,26 @@ where I: AsyncRead + AsyncWrite,
         }
 
         if !self.io.is_read_blocked() {
-            if wants_read && self.io.read_buf().is_empty() {
-                match self.io.read_from_io() {
-                    Ok(Async::Ready(_)) => (),
-                    Ok(Async::NotReady) => {
+            if self.io.read_buf().is_empty() {
+                match self.io.poll_read_from_io(cx) {
+                    Poll::Ready(Ok(_)) => (),
+                    Poll::Pending => {
                         trace!("maybe_notify; read_from_io blocked");
                         return
                     },
-                    Err(e) => {
+                    Poll::Ready(Err(e)) => {
                         trace!("maybe_notify; read_from_io error: {}", e);
                         self.state.close();
                     }
                 }
             }
-            if let Some(ref task) = self.state.read_task {
-                trace!("maybe_notify; notifying task");
-                task.notify();
-            } else {
-                trace!("maybe_notify; no task to notify");
-            }
+            self.state.notify_read = true;
         }
     }
 
-    fn try_keep_alive(&mut self) {
-        self.state.try_keep_alive();
-        self.maybe_notify();
+    fn try_keep_alive(&mut self, cx: &mut task::Context<'_>) {
+        self.state.try_keep_alive::<T>();
+        self.maybe_notify(cx);
     }
 
     pub fn can_write_head(&self) -> bool {
@@ -418,7 +386,35 @@ where I: AsyncRead + AsyncWrite,
         self.io.can_buffer()
     }
 
-    pub fn write_head(&mut self, mut head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
+    pub fn write_head(&mut self, head: MessageHead<T::Outgoing>, body: Option<BodyLength>) {
+        if let Some(encoder) = self.encode_head(head, body) {
+            self.state.writing = if !encoder.is_eof() {
+                Writing::Body(encoder)
+            } else if encoder.is_last() {
+                Writing::Closed
+            } else {
+                Writing::KeepAlive
+            };
+        }
+    }
+
+    pub fn write_full_msg(&mut self, head: MessageHead<T::Outgoing>, body: B) {
+        if let Some(encoder) = self.encode_head(head, Some(BodyLength::Known(body.remaining() as u64))) {
+            let is_last = encoder.is_last();
+            // Make sure we don't write a body if we weren't actually allowed
+            // to do so, like because its a HEAD request.
+            if !encoder.is_eof() {
+                encoder.danger_full_buf(body, self.io.write_buf());
+            }
+            self.state.writing = if is_last {
+                Writing::Closed
+            } else {
+                Writing::KeepAlive
+            }
+        }
+    }
+
+    fn encode_head(&mut self, mut head: MessageHead<T::Outgoing>, body: Option<BodyLength>) -> Option<Encoder> {
         debug_assert!(self.can_write_head());
 
         if !T::should_read_first() {
@@ -427,45 +423,63 @@ where I: AsyncRead + AsyncWrite,
 
         self.enforce_version(&mut head);
 
-        let buf = self.io.write_buf_mut();
-        self.state.writing = match T::encode(head, body, &mut self.state.method, buf) {
+        let buf = self.io.headers_buf();
+        match T::encode(Encode {
+            head: &mut head,
+            body,
+            keep_alive: self.state.wants_keep_alive(),
+            req_method: &mut self.state.method,
+            title_case_headers: self.state.title_case_headers,
+        }, buf) {
             Ok(encoder) => {
-                if !encoder.is_eof() {
-                    Writing::Body(encoder)
-                } else if encoder.is_last() {
-                    Writing::Closed
-                } else {
-                    Writing::KeepAlive
-                }
+                debug_assert!(self.state.cached_headers.is_none());
+                debug_assert!(head.headers.is_empty());
+                self.state.cached_headers = Some(head.headers);
+                Some(encoder)
             },
             Err(err) => {
                 self.state.error = Some(err);
-                Writing::Closed
+                self.state.writing = Writing::Closed;
+                None
+            },
+        }
+    }
+
+    // Fix keep-alives when Connection: keep-alive header is not present
+    fn fix_keep_alive(&mut self, head: &mut MessageHead<T::Outgoing>) {
+        let outgoing_is_keep_alive = head
+            .headers
+            .get(CONNECTION)
+            .and_then(|value| Some(connection_keep_alive(value)))
+            .unwrap_or(false);
+
+        if !outgoing_is_keep_alive {
+            match head.version {
+                // If response is version 1.0 and keep-alive is not present in the response,
+                // disable keep-alive so the server closes the connection
+                Version::HTTP_10 => self.state.disable_keep_alive(),
+                // If response is version 1.1 and keep-alive is wanted, add
+                // Connection: keep-alive header when not present
+                Version::HTTP_11 => if self.state.wants_keep_alive() {
+                    head.headers
+                        .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+                },
+                _ => (),
             }
-        };
+        }
     }
 
     // If we know the remote speaks an older version, we try to fix up any messages
     // to work with our older peer.
     fn enforce_version(&mut self, head: &mut MessageHead<T::Outgoing>) {
-        //use header::Connection;
-
-        let wants_keep_alive = if self.state.wants_keep_alive() {
-            let ka = head.should_keep_alive();
-            self.state.keep_alive &= ka;
-            ka
-        } else {
-            false
-        };
 
         match self.state.version {
             Version::HTTP_10 => {
+                // Fixes response or connection when keep-alive header is not present
+                self.fix_keep_alive(head);
                 // If the remote only knows HTTP/1.0, we should force ourselves
                 // to do only speak HTTP/1.0 as well.
                 head.version = Version::HTTP_10;
-                if wants_keep_alive {
-                    //TODO: head.headers.set(Connection::keep_alive());
-                }
             },
             _ => {
                 // If the remote speaks HTTP/1.1, then it *should* be fine with
@@ -475,61 +489,76 @@ where I: AsyncRead + AsyncWrite,
         }
     }
 
-    pub fn write_body(&mut self, chunk: Option<B>) -> StartSend<Option<B>, io::Error> {
-        debug_assert!(self.can_write_body());
-
-        if !self.can_buffer_body() {
-            if let Async::NotReady = self.flush()? {
-                // if chunk is Some(&[]), aka empty, whatever, just skip it
-                if chunk.as_ref().map(|c| c.as_ref().is_empty()).unwrap_or(false) {
-                    return Ok(AsyncSink::Ready);
-                } else {
-                    return Ok(AsyncSink::NotReady(chunk));
-                }
-            }
-        }
+    pub fn write_body(&mut self, chunk: B) {
+        debug_assert!(self.can_write_body() && self.can_buffer_body());
+        // empty chunks should be discarded at Dispatcher level
+        debug_assert!(chunk.remaining() != 0);
 
         let state = match self.state.writing {
             Writing::Body(ref mut encoder) => {
-                if let Some(chunk) = chunk {
-                    if chunk.as_ref().is_empty() {
-                        return Ok(AsyncSink::Ready);
-                    }
+                self.io.buffer(encoder.encode(chunk));
 
-                    let encoded = encoder.encode(Cursor::new(chunk));
-                    self.io.buffer(encoded);
-
-                    if encoder.is_eof() {
-                        if encoder.is_last() {
-                            Writing::Closed
-                        } else {
-                            Writing::KeepAlive
-                        }
+                if encoder.is_eof() {
+                    if encoder.is_last() {
+                        Writing::Closed
                     } else {
-                        return Ok(AsyncSink::Ready);
+                        Writing::KeepAlive
                     }
                 } else {
-                    // end of stream, that means we should try to eof
-                    match encoder.end() {
-                        Ok(end) => {
-                            if let Some(end) = end {
-                                self.io.buffer(end);
-                            }
-                            if encoder.is_last() {
-                                Writing::Closed
-                            } else {
-                                Writing::KeepAlive
-                            }
-                        },
-                        Err(_not_eof) => Writing::Closed,
-                    }
+                    return;
                 }
             },
             _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
         };
 
         self.state.writing = state;
-        Ok(AsyncSink::Ready)
+    }
+
+    pub fn write_body_and_end(&mut self, chunk: B) {
+        debug_assert!(self.can_write_body() && self.can_buffer_body());
+        // empty chunks should be discarded at Dispatcher level
+        debug_assert!(chunk.remaining() != 0);
+
+        let state = match self.state.writing {
+            Writing::Body(ref encoder) => {
+                let can_keep_alive = encoder.encode_and_end(chunk, self.io.write_buf());
+                if can_keep_alive {
+                    Writing::KeepAlive
+                } else {
+                    Writing::Closed
+                }
+            },
+            _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
+        };
+
+        self.state.writing = state;
+    }
+
+    pub fn end_body(&mut self) {
+        debug_assert!(self.can_write_body());
+
+        let state = match self.state.writing {
+            Writing::Body(ref mut encoder) => {
+                // end of stream, that means we should try to eof
+                match encoder.end() {
+                    Ok(end) => {
+                        if let Some(end) = end {
+                            self.io.buffer(end);
+                        }
+                        if encoder.is_last() {
+                            Writing::Closed
+                        } else {
+                            Writing::KeepAlive
+                        }
+                    },
+                    Err(_not_eof) => Writing::Closed,
+                }
+            },
+            _ => return,
+        };
+
+        self.state.writing = state;
+
     }
 
     // When we get a parse error, depending on what side we are, we might be able
@@ -537,10 +566,17 @@ where I: AsyncRead + AsyncWrite,
     //
     // - Client: there is nothing we can do
     // - Server: if Response hasn't been written yet, we can send a 4xx response
-    fn on_parse_error(&mut self, err: ::Error) -> ::Result<()> {
+    fn on_parse_error(&mut self, err: crate::Error) -> crate::Result<()> {
+
         match self.state.writing {
             Writing::Init => {
+                if self.has_h2_prefix() {
+                    return Err(crate::Error::new_version_h2())
+                }
                 if let Some(msg) = T::on_error(&err) {
+                    // Drop the cached headers so as to not trigger a debug
+                    // assert in `write_head`...
+                    self.state.cached_headers.take();
                     self.write_head(msg, None);
                     self.state.error = Some(err);
                     return Ok(());
@@ -553,23 +589,22 @@ where I: AsyncRead + AsyncWrite,
         Err(err)
     }
 
-    pub fn flush(&mut self) -> Poll<(), io::Error> {
-        try_ready!(self.io.flush());
-        self.try_keep_alive();
-        trace!("flushed {:?}", self.state);
-        Ok(Async::Ready(()))
+    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        self.try_keep_alive(cx);
+        trace!("flushed({}): {:?}", T::LOG, self.state);
+        Poll::Ready(Ok(()))
     }
 
-    pub fn shutdown(&mut self) -> Poll<(), io::Error> {
-        match self.io.io_mut().shutdown() {
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Ok(Async::Ready(())) => {
-                trace!("shut down IO");
-                Ok(Async::Ready(()))
-            }
+    pub fn poll_shutdown(&mut self, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        match ready!(Pin::new(self.io.io_mut()).poll_shutdown(cx)) {
+            Ok(()) => {
+                trace!("shut down IO complete");
+                Poll::Ready(Ok(()))
+            },
             Err(e) => {
                 debug!("error shutting down IO: {}", e);
-                Err(e)
+                Poll::Ready(Err(e))
             }
         }
     }
@@ -590,17 +625,22 @@ where I: AsyncRead + AsyncWrite,
         }
     }
 
-    pub fn take_error(&mut self) -> ::Result<()> {
+    pub fn take_error(&mut self) -> crate::Result<()> {
         if let Some(err) = self.state.error.take() {
             Err(err)
         } else {
             Ok(())
         }
     }
+
+    pub(super) fn on_upgrade(&mut self) -> crate::upgrade::OnUpgrade {
+        trace!("{}: prepare possible HTTP upgrade", T::LOG);
+        self.state.prepare_upgrade()
+    }
 }
 
-impl<I, B: AsRef<[u8]>, T> fmt::Debug for Conn<I, B, T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl<I, B: Buf, T> fmt::Debug for Conn<I, B, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn")
             .field("state", &self.state)
             .field("io", &self.io)
@@ -608,13 +648,34 @@ impl<I, B: AsRef<[u8]>, T> fmt::Debug for Conn<I, B, T> {
     }
 }
 
+// B and T are never pinned
+impl<I: Unpin, B, T> Unpin for Conn<I, B, T> {}
+
 struct State {
-    error: Option<::Error>,
+    allow_half_close: bool,
+    /// Re-usable HeaderMap to reduce allocating new ones.
+    cached_headers: Option<HeaderMap>,
+    /// If an error occurs when there wasn't a direct way to return it
+    /// back to the user, this is set.
+    error: Option<crate::Error>,
+    /// Current keep-alive status.
     keep_alive: KA,
+    /// If mid-message, the HTTP Method that started it.
+    ///
+    /// This is used to know things such as if the message can include
+    /// a body or not.
     method: Option<Method>,
-    read_task: Option<Task>,
+    title_case_headers: bool,
+    /// Set to true when the Dispatcher should poll read operations
+    /// again. See the `maybe_notify` method for more.
+    notify_read: bool,
+    /// State of allowed reads
     reading: Reading,
+    /// State of allowed writes
     writing: Writing,
+    /// An expected pending HTTP upgrade.
+    upgrade: Option<crate::upgrade::Pending>,
+    /// Either HTTP/1.0 or 1.1 connection
     version: Version,
 }
 
@@ -634,20 +695,26 @@ enum Writing {
 }
 
 impl fmt::Debug for State {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("State")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut builder = f.debug_struct("State");
+        builder
             .field("reading", &self.reading)
             .field("writing", &self.writing)
-            .field("keep_alive", &self.keep_alive)
-            .field("error", &self.error)
-            //.field("method", &self.method)
-            .field("read_task", &self.read_task)
-            .finish()
+            .field("keep_alive", &self.keep_alive);
+
+        // Only show error field if it's interesting...
+        if let Some(ref error) = self.error {
+            builder.field("error", error);
+        }
+
+        // Purposefully leaving off other fields..
+
+        builder.finish()
     }
 }
 
 impl fmt::Debug for Writing {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Writing::Init => f.write_str("Init"),
             Writing::Body(ref enc) => f.debug_tuple("Body")
@@ -662,6 +729,7 @@ impl fmt::Debug for Writing {
 impl ::std::ops::BitAndAssign<bool> for KA {
     fn bitand_assign(&mut self, enabled: bool) {
         if !enabled {
+            trace!("remote disabling keep-alive");
             *self = KA::Disabled;
         }
     }
@@ -709,7 +777,6 @@ impl State {
     fn close_read(&mut self) {
         trace!("State::close_read()");
         self.reading = Reading::Closed;
-        self.read_task = None;
         self.keep_alive.disable();
     }
 
@@ -727,12 +794,13 @@ impl State {
         }
     }
 
-    fn try_keep_alive(&mut self) {
+    fn try_keep_alive<T: Http1Transaction>(&mut self) {
         match (&self.reading, &self.writing) {
             (&Reading::KeepAlive, &Writing::KeepAlive) => {
                 if let KA::Busy = self.keep_alive.status() {
-                    self.idle();
+                    self.idle::<T>();
                 } else {
+                    trace!("try_keep_alive({}): could keep-alive, but status = {:?}", T::LOG, self.keep_alive);
                     self.close();
                 }
             },
@@ -755,12 +823,23 @@ impl State {
         self.keep_alive.busy();
     }
 
-    fn idle(&mut self) {
+    fn idle<T: Http1Transaction>(&mut self) {
+        debug_assert!(!self.is_idle(), "State::idle() called while idle");
+
         self.method = None;
         self.keep_alive.idle();
         if self.is_idle() {
             self.reading = Reading::Init;
             self.writing = Writing::Init;
+
+            // !T::should_read_first() means Client.
+            //
+            // If Client connection has just gone idle, the Dispatcher
+            // should try the poll loop one more time, so as to poll the
+            // pending requests stream.
+            if !T::should_read_first() {
+                self.notify_read = true;
+            }
         } else {
             self.close();
         }
@@ -787,12 +866,58 @@ impl State {
             _ => false
         }
     }
+
+    fn prepare_upgrade(&mut self) -> crate::upgrade::OnUpgrade {
+        debug_assert!(self.upgrade.is_none());
+        let (tx, rx) = crate::upgrade::pending();
+        self.upgrade = Some(tx);
+        rx
+    }
 }
 
 #[cfg(test)]
-//TODO: rewrite these using dispatch
 mod tests {
+    #[cfg(feature = "nightly")]
+    #[bench]
+    fn bench_read_head_short(b: &mut ::test::Bencher) {
+        use super::*;
+        let s = b"GET / HTTP/1.1\r\nHost: localhost:8080\r\n\r\n";
+        let len = s.len();
+        b.bytes = len as u64;
+
+        // an empty IO, we'll be skipping and using the read buffer anyways
+        let io = tokio_test::io::Builder::new().build();
+        let mut conn = Conn::<_, crate::Chunk, crate::proto::h1::ServerTransaction>::new(io);
+        *conn.io.read_buf_mut() = ::bytes::BytesMut::from(&s[..]);
+        conn.state.cached_headers = Some(HeaderMap::with_capacity(2));
+
+        let mut rt = tokio::runtime::current_thread::Runtime::new().unwrap();
+
+        b.iter(|| {
+            rt.block_on(futures_util::future::poll_fn(|cx| {
+                match conn.poll_read_head(cx) {
+                    Poll::Ready(Some(Ok(x))) => {
+                        ::test::black_box(&x);
+                        let mut headers = x.0.headers;
+                        headers.clear();
+                        conn.state.cached_headers = Some(headers);
+                    },
+                    f => panic!("expected Ready(Some(Ok(..))): {:?}", f)
+                }
+
+
+                conn.io.read_buf_mut().reserve(1);
+                unsafe {
+                    conn.io.read_buf_mut().set_len(len);
+                }
+                conn.state.reading = Reading::Init;
+                Poll::Ready(())
+            }));
+        });
+    }
+
     /*
+    //TODO: rewrite these using dispatch... someday...
     use futures::{Async, Future, Stream, Sink};
     use futures::future;
 
@@ -985,7 +1110,6 @@ mod tests {
 
     #[test]
     fn test_conn_body_write_length() {
-        extern crate pretty_env_logger;
         let _ = pretty_env_logger::try_init();
         let _: Result<(), ()> = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 0);

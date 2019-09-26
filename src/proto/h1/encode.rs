@@ -1,12 +1,14 @@
-//use std::cmp;
 use std::fmt;
 
 use bytes::{Buf, IntoBuf};
 use bytes::buf::{Chain, Take};
 use iovec::IoVec;
 
+use crate::common::StaticBuf;
+use super::io::WriteBuf;
+
 /// Encoders to handle different Transfer-Encodings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Encoder {
     kind: Kind,
     is_last: bool,
@@ -32,15 +34,15 @@ enum Kind {
     ///
     /// This is mostly only used with HTTP/1.0 with a length. This kind requires
     /// the connection to be closed when the body is finished.
-    Eof
+    CloseDelimited,
 }
 
 #[derive(Debug)]
 enum BufKind<B> {
     Exact(B),
     Limited(Take<B>),
-    Chunked(Chain<ChunkSize, Chain<B, CrLf>>),
-    ChunkedEnd(CrLf),
+    Chunked(Chain<Chain<ChunkSize, B>, StaticBuf>),
+    ChunkedEnd(StaticBuf),
 }
 
 impl Encoder {
@@ -58,8 +60,8 @@ impl Encoder {
         Encoder::new(Kind::Length(len))
     }
 
-    pub fn eof() -> Encoder {
-        Encoder::new(Kind::Eof)
+    pub fn close_delimited() -> Encoder {
+        Encoder::new(Kind::CloseDelimited)
     }
 
     pub fn is_eof(&self) -> bool {
@@ -69,8 +71,9 @@ impl Encoder {
         }
     }
 
-    pub fn set_last(&mut self) {
-        self.is_last = true;
+    pub fn set_last(mut self, is_last: bool) -> Self {
+        self.is_last = is_last;
+        self
     }
 
     pub fn is_last(&self) -> bool {
@@ -81,7 +84,7 @@ impl Encoder {
         match self.kind {
             Kind::Length(0) => Ok(None),
             Kind::Chunked => Ok(Some(EncodedBuf {
-                kind: BufKind::ChunkedEnd(CrLf(b"0\r\n\r\n")),
+                kind: BufKind::ChunkedEnd(StaticBuf(b"0\r\n\r\n")),
             })),
             _ => Err(NotEof),
         }
@@ -93,13 +96,15 @@ impl Encoder {
     {
         let msg = msg.into_buf();
         let len = msg.remaining();
-        assert!(len > 0, "encode() called with empty buf");
+        debug_assert!(len > 0, "encode() called with empty buf");
 
-        let buf = match self.kind {
+        let kind = match self.kind {
             Kind::Chunked => {
                 trace!("encoding chunked {}B", len);
-                BufKind::Chunked(ChunkSize::new(len)
-                    .chain(msg.chain(CrLf(b"\r\n"))))
+                let buf = ChunkSize::new(len)
+                    .chain(msg)
+                    .chain(StaticBuf(b"\r\n"));
+                BufKind::Chunked(buf)
             },
             Kind::Length(ref mut remaining) => {
                 trace!("sized write, len = {}", len);
@@ -112,13 +117,88 @@ impl Encoder {
                     BufKind::Exact(msg)
                 }
             },
-            Kind::Eof => {
-                trace!("eof write {}B", len);
+            Kind::CloseDelimited => {
+                trace!("close delimited write {}B", len);
                 BufKind::Exact(msg)
             }
         };
         EncodedBuf {
-            kind: buf,
+            kind,
+        }
+    }
+
+    pub(super) fn encode_and_end<B>(&self, msg: B, dst: &mut WriteBuf<EncodedBuf<B::Buf>>) -> bool
+    where
+        B: IntoBuf,
+    {
+        let msg = msg.into_buf();
+        let len = msg.remaining();
+        debug_assert!(len > 0, "encode() called with empty buf");
+
+        match self.kind {
+            Kind::Chunked => {
+                trace!("encoding chunked {}B", len);
+                let buf = ChunkSize::new(len)
+                    .chain(msg)
+                    .chain(StaticBuf(b"\r\n0\r\n\r\n"));
+                dst.buffer(buf);
+                !self.is_last
+            },
+            Kind::Length(remaining) => {
+                use std::cmp::Ordering;
+
+                trace!("sized write, len = {}", len);
+                match (len as u64).cmp(&remaining) {
+                    Ordering::Equal => {
+                        dst.buffer(msg);
+                        !self.is_last
+                    },
+                    Ordering::Greater => {
+                        dst.buffer(msg.take(remaining as usize));
+                        !self.is_last
+                    },
+                    Ordering::Less => {
+                        dst.buffer(msg);
+                        false
+                    }
+                }
+            },
+            Kind::CloseDelimited => {
+                trace!("close delimited write {}B", len);
+                dst.buffer(msg);
+                false
+            }
+        }
+    }
+
+    /// Encodes the full body, without verifying the remaining length matches.
+    ///
+    /// This is used in conjunction with Payload::__hyper_full_data(), which
+    /// means we can trust that the buf has the correct size (the buf itself
+    /// was checked to make the headers).
+    pub(super) fn danger_full_buf<B>(self, msg: B, dst: &mut WriteBuf<EncodedBuf<B::Buf>>)
+    where
+        B: IntoBuf,
+    {
+        let msg = msg.into_buf();
+        debug_assert!(msg.remaining() > 0, "encode() called with empty buf");
+        debug_assert!(match self.kind {
+            Kind::Length(len) => len == msg.remaining() as u64,
+            _ => true,
+        }, "danger_full_buf length mismatches");
+
+        match self.kind {
+            Kind::Chunked => {
+                let len = msg.remaining();
+                trace!("encoding chunked {}B", len);
+                let buf = ChunkSize::new(len)
+                    .chain(msg)
+                    .chain(StaticBuf(b"\r\n0\r\n\r\n"));
+                dst.buffer(buf);
+            },
+            _ => {
+                dst.buffer(msg);
+            },
         }
     }
 }
@@ -218,7 +298,7 @@ impl Buf for ChunkSize {
 }
 
 impl fmt::Debug for ChunkSize {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ChunkSize")
             .field("bytes", &&self.bytes[..self.len.into()])
             .field("pos", &self.pos)
@@ -236,32 +316,26 @@ impl fmt::Write for ChunkSize {
     }
 }
 
-#[derive(Debug)]
-struct CrLf(&'static [u8]);
-
-impl Buf for CrLf {
-    #[inline]
-    fn remaining(&self) -> usize {
-        self.0.len()
+impl<B: Buf> From<B> for EncodedBuf<B> {
+    fn from(buf: B) -> Self {
+        EncodedBuf {
+            kind: BufKind::Exact(buf),
+        }
     }
+}
 
-    #[inline]
-    fn bytes(&self) -> &[u8] {
-        self.0
+impl<B: Buf> From<Take<B>> for EncodedBuf<B> {
+    fn from(buf: Take<B>) -> Self {
+        EncodedBuf {
+            kind: BufKind::Limited(buf),
+        }
     }
+}
 
-    #[inline]
-    fn advance(&mut self, cnt: usize) {
-        self.0 = &self.0[cnt..];
-    }
-
-    #[inline]
-    fn bytes_vec<'t>(&'t self, dst: &mut [&'t IoVec]) -> usize {
-        if dst.is_empty() {
-            return 0;
-        } else {
-            dst[0] = self.0.into();
-            return 1;
+impl<B: Buf> From<Chain<Chain<ChunkSize, B>, StaticBuf>> for EncodedBuf<B> {
+    fn from(buf: Chain<Chain<ChunkSize, B>, StaticBuf>) -> Self {
+        EncodedBuf {
+            kind: BufKind::Chunked(buf),
         }
     }
 }
@@ -323,7 +397,7 @@ mod tests {
 
     #[test]
     fn eof() {
-        let mut encoder = Encoder::eof();
+        let mut encoder = Encoder::close_delimited();
         let mut dst = Vec::new();
 
 

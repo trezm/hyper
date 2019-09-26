@@ -1,37 +1,54 @@
 #![feature(test)]
 #![deny(warnings)]
 
-extern crate futures;
-extern crate hyper;
-extern crate pretty_env_logger;
 extern crate test;
-extern crate tokio;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
+use std::time::Duration;
 
-use futures::{future, stream, Future, Stream};
-use futures::sync::oneshot;
+use futures_util::{stream, StreamExt};
+use tokio::runtime::current_thread;
+use tokio::sync::oneshot;
 
-use hyper::{Body, Request, Response};
-use hyper::server::Service;
+use hyper::{Body, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
 
 macro_rules! bench_server {
     ($b:ident, $header:expr, $body:expr) => ({
         let _ = pretty_env_logger::try_init();
-        let (_until_tx, until_rx) = oneshot::channel();
+        let (_until_tx, until_rx) = oneshot::channel::<()>();
         let addr = {
             let (addr_tx, addr_rx) = mpsc::channel();
-            ::std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let addr = "127.0.0.1:0".parse().unwrap();
-                let srv = hyper::server::Http::new().bind(&addr, || Ok(BenchPayload {
-                    header: $header,
-                    body: $body,
-                })).unwrap();
-                let addr = srv.local_addr().unwrap();
-                addr_tx.send(addr).unwrap();
-                tokio::run(srv.run_until(until_rx.map_err(|_| ())).map_err(|e| panic!("server error: {}", e)));
+                let make_svc = make_service_fn(|_| async {
+                    Ok::<_, hyper::Error>(service_fn(|_| async {
+                        Ok::<_, hyper::Error>(Response::builder()
+                            .header($header.0, $header.1)
+                            .header("content-type", "text/plain")
+                            .body($body())
+                            .unwrap()
+                        )
+                    }))
+                });
+                let srv = Server::bind(&addr)
+                    .serve(make_svc);
+
+                addr_tx.send(srv.local_addr()).unwrap();
+
+                let graceful = srv
+                    .with_graceful_shutdown(async {
+                        until_rx.await.ok();
+                    });
+                let mut rt = current_thread::Runtime::new().unwrap();
+                rt.spawn(async {
+                    if let Err(e) = graceful.await {
+                        panic!("server error: {}", e);
+                    }
+                });
+                rt.run().unwrap();
             });
 
             addr_rx.recv().unwrap()
@@ -45,7 +62,7 @@ macro_rules! bench_server {
         };
 
         let mut tcp = TcpStream::connect(addr).unwrap();
-        tcp.set_read_timeout(Some(::std::time::Duration::from_secs(3))).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut buf = [0u8; 8192];
 
         $b.bytes = 35 + total_bytes as u64;
@@ -78,7 +95,7 @@ fn throughput_fixedsize_large_payload(b: &mut test::Bencher) {
 fn throughput_fixedsize_many_chunks(b: &mut test::Bencher) {
     bench_server!(b, ("content-length", "1000000"), || {
         static S: &'static [&'static [u8]] = &[&[b'x'; 1_000] as &[u8]; 1_000] as _;
-        Body::wrap_stream(stream::iter_ok(S.iter()).map(|&s| s))
+        Body::wrap_stream(stream::iter(S.iter()).map(|&s| Ok::<_, String>(s)))
     })
 }
 
@@ -96,7 +113,7 @@ fn throughput_chunked_large_payload(b: &mut test::Bencher) {
 fn throughput_chunked_many_chunks(b: &mut test::Bencher) {
     bench_server!(b, ("transfer-encoding", "chunked"), || {
         static S: &'static [&'static [u8]] = &[&[b'x'; 1_000] as &[u8]; 1_000] as _;
-        Body::wrap_stream(stream::iter_ok(S.iter()).map(|&s| s))
+        Body::wrap_stream(stream::iter(S.iter()).map(|&s| Ok::<_, String>(s)))
     })
 }
 
@@ -105,7 +122,7 @@ fn raw_tcp_throughput_small_payload(b: &mut test::Bencher) {
     let (tx, rx) = mpsc::channel();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    ::std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut sock = listener.accept().unwrap().0;
 
         let mut buf = [0u8; 8192];
@@ -147,7 +164,7 @@ fn raw_tcp_throughput_large_payload(b: &mut test::Bencher) {
         Date: Fri, 12 May 2017 18:21:45 GMT\r\n\
         \r\n\
     ";
-    ::std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut sock = listener.accept().unwrap().0;
 
         let mut buf = [0u8; 8192];
@@ -176,28 +193,4 @@ fn raw_tcp_throughput_large_payload(b: &mut test::Bencher) {
         assert_eq!(sum, expect_read);
     });
     tx.send(()).unwrap();
-}
-
-struct BenchPayload<F> {
-    header: (&'static str, &'static str),
-    body: F,
-}
-
-impl<F, B> Service for BenchPayload<F>
-where
-    F: Fn() -> B,
-{
-    type Request = Request<Body>;
-    type Response = Response<B>;
-    type Error = hyper::Error;
-    type Future = future::FutureResult<Self::Response, hyper::Error>;
-    fn call(&self, _req: Self::Request) -> Self::Future {
-        future::ok(
-            Response::builder()
-                .header(self.header.0, self.header.1)
-                .header("content-type", "text/plain")
-                .body((self.body)())
-                .unwrap()
-        )
-    }
 }

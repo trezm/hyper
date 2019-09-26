@@ -1,90 +1,128 @@
 #![deny(warnings)]
-extern crate futures;
-extern crate hyper;
-extern crate pretty_env_logger;
-extern crate tokio;
 
-use futures::{Future, Stream};
-use futures::future::lazy;
-use tokio::reactor::Handle;
+use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode, header};
+use hyper::client::HttpConnector;
+use hyper::service::{make_service_fn, service_fn};
+use futures_util::{TryStreamExt};
 
-use hyper::{Body, Chunk, Client, Method, Request, Response, StatusCode};
-use hyper::server::{Http, Service};
+type GenericError = Box<dyn std::error::Error + Send + Sync>;
+type Result<T> = std::result::Result<T, GenericError>;
 
-#[allow(unused)]
-use std::ascii::AsciiExt;
-
-static NOTFOUND: &[u8] = b"Not Found";
-static URL: &str = "http://127.0.0.1:1337/web_api";
 static INDEX: &[u8] = b"<a href=\"test.html\">test.html</a>";
-static LOWERCASE: &[u8] = b"i am a lower case string";
+static INTERNAL_SERVER_ERROR: &[u8] = b"Internal Server Error";
+static NOTFOUND: &[u8] = b"Not Found";
+static POST_DATA: &str = r#"{"original": "data"}"#;
+static URL: &str = "http://127.0.0.1:1337/json_api";
 
-struct ResponseExamples(Handle);
+async fn client_request_response(
+    client: &Client<HttpConnector>
+) -> Result<Response<Body>> {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(URL)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(POST_DATA.into())
+        .unwrap();
 
-impl Service for ResponseExamples {
-    type Request = Request<Body>;
-    type Response = Response<Body>;
-    type Error = hyper::Error;
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error> + Send>;
+    let web_res = client.request(req).await?;
+    // Compare the JSON we sent (before) with what we received (after):
+    let body = Body::wrap_stream(web_res.into_body().map_ok(|b| {
+        Chunk::from(format!("<b>POST request body</b>: {}<br><b>Response</b>: {}",
+                            POST_DATA,
+                            std::str::from_utf8(&b).unwrap()))
+    }));
 
-    fn call(&self, req: Self::Request) -> Self::Future {
-        match (req.method(), req.uri().path()) {
-            (&Method::GET, "/") | (&Method::GET, "/index.html") => {
-                let body = Body::from(INDEX);
-                Box::new(futures::future::ok(Response::new(body)))
-            },
-            (&Method::GET, "/test.html") => {
-                // Run a web query against the web api below
-                let client = Client::configure().build(&self.0);
-                let req = Request::builder()
-                    .method(Method::POST)
-                    .uri(URL)
-                    .body(LOWERCASE.into())
-                    .unwrap();
-                let web_res_future = client.request(req);
-
-                Box::new(web_res_future.map(|web_res| {
-                    let body = Body::wrap_stream(web_res.into_body().into_stream().map(|b| {
-                        Chunk::from(format!("before: '{:?}'<br>after: '{:?}'",
-                                            std::str::from_utf8(LOWERCASE).unwrap(),
-                                            std::str::from_utf8(&b).unwrap()))
-                    }));
-                    Response::new(body)
-                }))
-            },
-            (&Method::POST, "/web_api") => {
-                // A web api to run against. Simple upcasing of the body.
-                let body = Body::wrap_stream(req.into_body().into_stream().map(|chunk| {
-                    let upper = chunk.iter().map(|byte| byte.to_ascii_uppercase())
-                        .collect::<Vec<u8>>();
-                    Chunk::from(upper)
-                }));
-                Box::new(futures::future::ok(Response::new(body)))
-            },
-            _ => {
-                let body = Body::from(NOTFOUND);
-                Box::new(futures::future::ok(Response::builder()
-                                             .status(StatusCode::NOT_FOUND)
-                                             .body(body)
-                                             .unwrap()))
-            }
-        }
-    }
-
+    Ok(Response::new(body))
 }
 
+async fn api_post_response(req: Request<Body>) -> Result<Response<Body>> {
+    // A web api to run against
+    let entire_body = req.into_body().try_concat().await?;
+    // TODO: Replace all unwraps with proper error handling
+    let str = String::from_utf8(entire_body.to_vec())?;
+    let mut data : serde_json::Value = serde_json::from_str(&str)?;
+    data["test"] = serde_json::Value::from("test_value");
+    let json = serde_json::to_string(&data)?;
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json))?;
+    Ok(response)
+}
 
-fn main() {
+async fn api_get_response() -> Result<Response<Body>> {
+    let data = vec!["foo", "bar"];
+    let res = match serde_json::to_string(&data) {
+        Ok(json) => {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json))
+                .unwrap()
+        }
+        Err(_) => {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(INTERNAL_SERVER_ERROR.into())
+                .unwrap()
+        }
+    };
+    Ok(res)
+}
+
+async fn response_examples(
+    req: Request<Body>,
+    client: Client<HttpConnector>
+) -> Result<Response<Body>> {
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/") |
+        (&Method::GET, "/index.html") => {
+            Ok(Response::new(INDEX.into()))
+        },
+        (&Method::GET, "/test.html") => {
+            client_request_response(&client).await
+        },
+        (&Method::POST, "/json_api") => {
+            api_post_response(req).await
+        },
+        (&Method::GET, "/json_api") => {
+            api_get_response().await
+        }
+        _ => {
+            // Return 404 not found response.
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(NOTFOUND.into())
+                .unwrap())
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     pretty_env_logger::init();
+
     let addr = "127.0.0.1:1337".parse().unwrap();
 
-    tokio::run(lazy(move || {
-        let handle = Handle::current();
-        let serve = Http::new().serve_addr(&addr, move || Ok(ResponseExamples(handle.clone()))).unwrap();
-        println!("Listening on http://{} with 1 thread.", serve.incoming_ref().local_addr());
+    // Share a `Client` with all `Service`s
+    let client = Client::new();
 
-        serve.map_err(|_| ()).for_each(move |conn| {
-            tokio::spawn(conn.map(|_| ()).map_err(|err| println!("serve error: {:?}", err)))
-        })
-    }));
+    let new_service = make_service_fn(move |_| {
+        // Move a clone of `client` into the `service_fn`.
+        let client = client.clone();
+        async {
+            Ok::<_, GenericError>(service_fn(move |req| {
+                // Clone again to ensure that client outlives this closure.
+                response_examples(req, client.to_owned())
+            }))
+        }
+    });
+
+    let server = Server::bind(&addr)
+        .serve(new_service);
+
+    println!("Listening on http://{}", addr);
+
+    server.await?;
+
+    Ok(())
 }
